@@ -29,8 +29,8 @@ interface Props {
   initialDesignId: string | null;
 }
 
-type Sheet = null | "templates" | "elements" | "text" | "fonts" | "color";
-type SidebarTab = "templates" | "elements" | "tools";
+type Sheet = null | "templates" | "elements" | "text" | "fonts" | "color" | "ai";
+type SidebarTab = "ai" | "templates" | "elements" | "tools";
 
 export default function Editor({ spec, initialDesignId }: Props) {
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -57,6 +57,9 @@ export default function Editor({ spec, initialDesignId }: Props) {
 
   const skipNextChangeRef = useRef(false);
   const templates = useMemo(() => templatesFor(spec), [spec]);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiState, setAiState] = useState<"idle" | "loading" | "error">("idle");
+  const [aiError, setAiError] = useState<string | null>(null);
 
   const sideLabel = useMemo(
     () => (spec.sides === 2 ? (side === 0 ? "Front" : "Back") : "Single side"),
@@ -303,6 +306,10 @@ export default function Editor({ spec, initialDesignId }: Props) {
 
   function applyTemplate(tmpl: TemplateDef) {
     const sides = templateToFabricSides(tmpl, spec, ppiRef.current);
+    applyFabricSides(sides);
+  }
+
+  function applyFabricSides(sides: FabricSide[]) {
     setDoc((d) => ({ ...d, sides }));
     setSide(0);
     setOpenSheet(null);
@@ -315,6 +322,30 @@ export default function Editor({ spec, initialDesignId }: Props) {
         historyRef.current?.reset();
         syncHistoryButtons();
       });
+    }
+  }
+
+  async function generateWithAi() {
+    if (!aiPrompt.trim() || aiState === "loading") return;
+    setAiState("loading");
+    setAiError(null);
+    try {
+      const res = await fetch("/api/ai/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: aiPrompt.trim(),
+          productKey: spec.key,
+          ppi: ppiRef.current,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error?.formErrors?.[0] || json.error || "generation failed");
+      applyFabricSides(json.sides as FabricSide[]);
+      setAiState("idle");
+    } catch (err) {
+      setAiError(err instanceof Error ? err.message : String(err));
+      setAiState("error");
     }
   }
 
@@ -492,18 +523,27 @@ export default function Editor({ spec, initialDesignId }: Props) {
         {/* Desktop sidebar */}
         <aside className="hidden border-l border-ink/10 bg-white lg:flex lg:flex-col">
           <div className="flex border-b border-ink/10 text-xs">
-            {(["templates", "elements", "tools"] as const).map((t) => (
+            {(["ai", "templates", "elements", "tools"] as const).map((t) => (
               <button
                 key={t}
                 type="button"
                 onClick={() => setSidebarTab(t)}
                 className={`flex-1 px-3 py-2 capitalize ${sidebarTab === t ? "border-b-2 border-ink font-medium" : "text-ink/60"}`}
               >
-                {t}
+                {t === "ai" ? "AI ✨" : t}
               </button>
             ))}
           </div>
           <div className="flex-1 overflow-y-auto p-4">
+            {sidebarTab === "ai" && (
+              <AiPanel
+                prompt={aiPrompt}
+                setPrompt={setAiPrompt}
+                onGenerate={generateWithAi}
+                state={aiState}
+                error={aiError}
+              />
+            )}
             {sidebarTab === "templates" && (
               <TemplateGrid templates={templates} onPick={applyTemplate} />
             )}
@@ -543,6 +583,17 @@ export default function Editor({ spec, initialDesignId }: Props) {
 
       {/* Mobile bottom dock */}
       <div className="border-t border-ink/10 bg-white pb-[env(safe-area-inset-bottom)] lg:hidden">
+        {openSheet === "ai" && (
+          <Sheet onClose={() => setOpenSheet(null)} title="Generate with AI ✨">
+            <AiPanel
+              prompt={aiPrompt}
+              setPrompt={setAiPrompt}
+              onGenerate={generateWithAi}
+              state={aiState}
+              error={aiError}
+            />
+          </Sheet>
+        )}
         {openSheet === "templates" && (
           <Sheet onClose={() => setOpenSheet(null)} title="Pick a template">
             <TemplateGrid templates={templates} onPick={applyTemplate} compact />
@@ -602,6 +653,7 @@ export default function Editor({ spec, initialDesignId }: Props) {
         )}
 
         <div className="flex items-stretch gap-1 overflow-x-auto px-2 py-2">
+          <DockBtn label="AI" icon="✨" onClick={() => setOpenSheet("ai")} />
           <DockBtn label="Templates" icon="✦" onClick={() => setOpenSheet("templates")} />
           <DockBtn label="Elements" icon="❖" onClick={() => setOpenSheet("elements")} />
           <DockBtn label="Text" icon="T" onClick={() => setOpenSheet("text")} />
@@ -674,6 +726,72 @@ function TemplateGrid({
           <div className="text-xs font-medium">{t.name}</div>
         </button>
       ))}
+    </div>
+  );
+}
+
+function AiPanel({
+  prompt,
+  setPrompt,
+  onGenerate,
+  state,
+  error,
+}: {
+  prompt: string;
+  setPrompt: (v: string) => void;
+  onGenerate: () => void | Promise<void>;
+  state: "idle" | "loading" | "error";
+  error: string | null;
+}) {
+  const examples = [
+    "Bold business card for Maya, a yoga instructor in Brooklyn — sage green and cream",
+    "Postcard for a coffee roaster: warm tones, big '20% off' offer, modern serif type",
+    "Architect's business card — black background, neon accent, ultra minimal",
+  ];
+  return (
+    <div className="space-y-3">
+      <div className="text-xs text-ink/70">
+        Describe the design and the AI will fill the canvas. Editing afterwards
+        works exactly like a hand-built design — undo/redo included.
+      </div>
+      <textarea
+        value={prompt}
+        onChange={(e) => setPrompt(e.target.value)}
+        placeholder="e.g. Bold business card for Maya, a yoga instructor — sage green and cream, calming feel"
+        rows={5}
+        className="w-full resize-none rounded border border-ink/20 px-3 py-2 text-sm"
+        disabled={state === "loading"}
+      />
+      <button
+        type="button"
+        onClick={() => void onGenerate()}
+        disabled={state === "loading" || !prompt.trim()}
+        className="btn-primary w-full disabled:opacity-50"
+      >
+        {state === "loading" ? "Generating… (5–15s)" : "Generate ✨"}
+      </button>
+      {state === "error" && error && (
+        <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          {error}
+        </div>
+      )}
+      <div className="space-y-1">
+        <div className="text-[10px] uppercase tracking-wide text-ink/50">Try one</div>
+        {examples.map((ex) => (
+          <button
+            key={ex}
+            type="button"
+            onClick={() => setPrompt(ex)}
+            disabled={state === "loading"}
+            className="block w-full rounded border border-ink/10 bg-ink/5 px-2 py-1 text-left text-[11px] text-ink/70 hover:border-ink/30"
+          >
+            {ex}
+          </button>
+        ))}
+      </div>
+      <div className="text-[10px] text-ink/50">
+        Generated designs replace the current canvas. Use Undo (⌘Z) to revert.
+      </div>
     </div>
   );
 }

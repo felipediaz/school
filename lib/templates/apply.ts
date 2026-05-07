@@ -14,7 +14,19 @@ export function templateToFabricSides(
   spec: ProductSpec,
   ppi: number,
 ): FabricSide[] {
-  const sides = template.build(spec);
+  return tmplSidesToFabricSides(template.build(spec), spec, ppi);
+}
+
+/**
+ * Same conversion the templates use, but for ad-hoc TmplSide[] arrays — used
+ * by the AI generator so the editor's load path is identical for templates
+ * and AI-generated designs.
+ */
+export function tmplSidesToFabricSides(
+  sides: TmplSide[],
+  spec: ProductSpec,
+  ppi: number,
+): FabricSide[] {
   return sides.map((side) => sideToFabric(side, spec, ppi));
 }
 
