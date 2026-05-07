@@ -5,7 +5,6 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
-  clearArtwork,
   drawGuides,
   initCanvas,
   loadSide,
@@ -13,6 +12,16 @@ import {
 } from "@/lib/editor/fabricInit";
 import { PRINT_FONTS, DEFAULT_FONT } from "@/lib/editor/fonts";
 import { emptyDesign, type DesignDocument, type FabricSide } from "@/lib/editor/serialize";
+import { addSvgFromString } from "@/lib/editor/svg";
+import { makeHistory, type HistoryHandle } from "@/lib/editor/history";
+import { templatesFor } from "@/lib/templates/library";
+import { templateToFabricSides } from "@/lib/templates/apply";
+import type { TemplateDef } from "@/lib/templates/types";
+import {
+  ELEMENT_CATEGORIES,
+  elementsByCategory,
+  type ElementCategory,
+} from "@/lib/elements/library";
 import type { ProductSpec } from "@/lib/products/specs";
 
 interface Props {
@@ -20,7 +29,8 @@ interface Props {
   initialDesignId: string | null;
 }
 
-type Tool = null | "text" | "style" | "fonts";
+type Sheet = null | "templates" | "elements" | "text" | "fonts" | "color";
+type SidebarTab = "templates" | "elements" | "tools";
 
 export default function Editor({ spec, initialDesignId }: Props) {
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -28,6 +38,7 @@ export default function Editor({ spec, initialDesignId }: Props) {
   const fabricRef = useRef<fabric.Canvas | null>(null);
   const guidesRef = useRef<fabric.Object[]>([]);
   const ppiRef = useRef<number>(spec.dpi);
+  const historyRef = useRef<HistoryHandle | null>(null);
   const initedRef = useRef(false);
 
   const [side, setSide] = useState(0);
@@ -38,14 +49,25 @@ export default function Editor({ spec, initialDesignId }: Props) {
   const [textValue, setTextValue] = useState("Your text");
   const [fontFamily, setFontFamily] = useState(DEFAULT_FONT.family);
   const [fillColor, setFillColor] = useState("#111111");
-  const [openTool, setOpenTool] = useState<Tool>(null);
+  const [openSheet, setOpenSheet] = useState<Sheet>(initialDesignId ? null : "templates");
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>("tools");
   const [hasSelection, setHasSelection] = useState(false);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+
   const skipNextChangeRef = useRef(false);
+  const templates = useMemo(() => templatesFor(spec), [spec]);
 
   const sideLabel = useMemo(
     () => (spec.sides === 2 ? (side === 0 ? "Front" : "Back") : "Single side"),
     [spec.sides, side],
   );
+
+  function syncHistoryButtons() {
+    const h = historyRef.current;
+    setCanUndo(!!h?.canUndo());
+    setCanRedo(!!h?.canRedo());
+  }
 
   // Build canvas + ResizeObserver to keep the canvas the right size for the
   // viewport. We rebuild the Fabric canvas on size change because changing
@@ -57,10 +79,8 @@ export default function Editor({ spec, initialDesignId }: Props) {
       const stage = stageRef.current;
       const el = canvasEl.current;
       if (!stage || !el) return;
-      // Available space for the artwork inside the stage padding.
       const w = stage.clientWidth - 16;
       const h = stage.clientHeight - 16;
-      // Tear down previous instance before rebuilding (size changed).
       if (fabricRef.current) {
         const json = serializeSide(fabricRef.current) as FabricSide;
         json.ppi = ppiRef.current;
@@ -83,9 +103,21 @@ export default function Editor({ spec, initialDesignId }: Props) {
       ppiRef.current = chrome.displayPpi;
 
       attachListeners(chrome.canvas);
-      // Re-hydrate current side
       void loadSide(chrome.canvas, chrome.guides, doc.sides[side] ?? null).then(() => {
         guidesRef.current = drawGuides(chrome.canvas, spec, chrome.displayPpi);
+        // Initialise history once after first build.
+        if (!historyRef.current) {
+          historyRef.current = makeHistory(
+            () => fabricRef.current,
+            () => {
+              const c = fabricRef.current;
+              if (!c) return;
+              for (const g of guidesRef.current) c.remove(g);
+              guidesRef.current = drawGuides(c, spec, ppiRef.current);
+            },
+          );
+          syncHistoryButtons();
+        }
       });
       attachPinch(chrome.canvas, el);
     }
@@ -103,6 +135,8 @@ export default function Editor({ spec, initialDesignId }: Props) {
           next.sides[side] = json;
           return next;
         });
+        historyRef.current?.push();
+        syncHistoryButtons();
       };
       const onSel = () => setHasSelection(!!canvas.getActiveObject());
       canvas.on("object:added", onChange);
@@ -135,10 +169,8 @@ export default function Editor({ spec, initialDesignId }: Props) {
         const m = mid(e.touches);
         const rect = upper.getBoundingClientRect();
         const point = new fabric.Point(m.x - rect.left, m.y - rect.top);
-        // zoom
         const z = Math.max(0.4, Math.min(5, canvas.getZoom() * (d / lastDist)));
         canvas.zoomToPoint(point, z);
-        // pan (delta of midpoint)
         const vp = canvas.viewportTransform;
         if (vp) {
           vp[4] += m.x - lastMid.x;
@@ -174,19 +206,45 @@ export default function Editor({ spec, initialDesignId }: Props) {
     });
     if (stageRef.current) ro.observe(stageRef.current);
 
-    if (initialDesignId) {
-      void loadDesign(initialDesignId);
-    }
+    if (initialDesignId) void loadDesign(initialDesignId);
 
     return () => {
       ro.disconnect();
       cancelAnimationFrame(raf);
+      historyRef.current?.dispose();
+      historyRef.current = null;
       fabricRef.current?.dispose();
       fabricRef.current = null;
       initedRef.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Keyboard shortcuts: Cmd/Ctrl+Z = undo, Cmd/Ctrl+Shift+Z = redo
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const isUndoCombo = (e.metaKey || e.ctrlKey) && !e.shiftKey && (e.key === "z" || e.key === "Z");
+      const isRedoCombo = (e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "z" || e.key === "Z");
+      if (!isUndoCombo && !isRedoCombo) return;
+      e.preventDefault();
+      void (isRedoCombo ? historyRef.current?.redo() : historyRef.current?.undo()).then(() => {
+        const c = fabricRef.current;
+        if (c) {
+          const json = serializeSide(c) as FabricSide;
+          json.ppi = ppiRef.current;
+          setDoc((d) => {
+            const next = { ...d, sides: d.sides.slice() };
+            next.sides[side] = json;
+            return next;
+          });
+        }
+        syncHistoryButtons();
+      });
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [side]);
 
   const loadDesign = useCallback(async (id: string) => {
     const res = await fetch(`/api/designs/${id}`);
@@ -199,6 +257,8 @@ export default function Editor({ spec, initialDesignId }: Props) {
       skipNextChangeRef.current = true;
       await loadSide(fabricRef.current, guidesRef.current, json.design.data.sides[0] ?? null);
       guidesRef.current = drawGuides(fabricRef.current, spec, ppiRef.current);
+      historyRef.current?.reset();
+      syncHistoryButtons();
     }
   }, [spec]);
 
@@ -210,6 +270,8 @@ export default function Editor({ spec, initialDesignId }: Props) {
     void loadSide(canvas, guidesRef.current, doc.sides[side] ?? null).then(() => {
       for (const g of guidesRef.current) canvas.remove(g);
       guidesRef.current = drawGuides(canvas, spec, ppiRef.current);
+      historyRef.current?.reset();
+      syncHistoryButtons();
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [side]);
@@ -239,6 +301,30 @@ export default function Editor({ spec, initialDesignId }: Props) {
     }
   }
 
+  function applyTemplate(tmpl: TemplateDef) {
+    const sides = templateToFabricSides(tmpl, spec, ppiRef.current);
+    setDoc((d) => ({ ...d, sides }));
+    setSide(0);
+    setOpenSheet(null);
+    const canvas = fabricRef.current;
+    if (canvas) {
+      skipNextChangeRef.current = true;
+      void loadSide(canvas, guidesRef.current, sides[0]).then(() => {
+        for (const g of guidesRef.current) canvas.remove(g);
+        guidesRef.current = drawGuides(canvas, spec, ppiRef.current);
+        historyRef.current?.reset();
+        syncHistoryButtons();
+      });
+    }
+  }
+
+  async function addElement(svg: string) {
+    const canvas = fabricRef.current;
+    if (!canvas) return;
+    const targetWidth = (spec.widthIn / 4) * ppiRef.current;
+    await addSvgFromString(canvas, svg, { fill: fillColor, targetWidthPx: targetWidth });
+  }
+
   function addText() {
     const canvas = fabricRef.current;
     if (!canvas) return;
@@ -254,7 +340,7 @@ export default function Editor({ spec, initialDesignId }: Props) {
     canvas.add(text);
     canvas.setActiveObject(text);
     canvas.requestRenderAll();
-    setOpenTool(null);
+    setOpenSheet(null);
   }
 
   function addRect() {
@@ -347,20 +433,34 @@ export default function Editor({ spec, initialDesignId }: Props) {
           onChange={(e) => setName(e.target.value)}
           className="min-w-0 flex-1 rounded border border-transparent px-2 py-1 text-sm font-medium hover:border-ink/20 focus:border-ink/40 focus:outline-none"
         />
+        <div className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            onClick={() => historyRef.current?.undo().then(syncHistoryButtons)}
+            disabled={!canUndo}
+            className="rounded p-1 text-base disabled:opacity-30"
+            title="Undo (⌘Z)"
+            aria-label="Undo"
+          >
+            ↶
+          </button>
+          <button
+            type="button"
+            onClick={() => historyRef.current?.redo().then(syncHistoryButtons)}
+            disabled={!canRedo}
+            className="rounded p-1 text-base disabled:opacity-30"
+            title="Redo (⌘⇧Z)"
+            aria-label="Redo"
+          >
+            ↷
+          </button>
+        </div>
         {spec.sides === 2 && (
           <div className="flex shrink-0 overflow-hidden rounded border border-ink/20 text-xs">
-            <button
-              type="button"
-              onClick={() => setSide(0)}
-              className={`px-2 py-1 ${side === 0 ? "bg-ink text-white" : ""}`}
-            >
+            <button type="button" onClick={() => setSide(0)} className={`px-2 py-1 ${side === 0 ? "bg-ink text-white" : ""}`}>
               Front
             </button>
-            <button
-              type="button"
-              onClick={() => setSide(1)}
-              className={`px-2 py-1 ${side === 1 ? "bg-ink text-white" : ""}`}
-            >
+            <button type="button" onClick={() => setSide(1)} className={`px-2 py-1 ${side === 1 ? "bg-ink text-white" : ""}`}>
               Back
             </button>
           </div>
@@ -373,7 +473,7 @@ export default function Editor({ spec, initialDesignId }: Props) {
       </div>
 
       {/* Stage + desktop sidebar */}
-      <div className="grid min-h-0 flex-1 lg:grid-cols-[1fr_320px]">
+      <div className="grid min-h-0 flex-1 lg:grid-cols-[1fr_340px]">
         <div
           ref={stageRef}
           className="relative flex min-h-0 items-center justify-center overflow-hidden bg-[radial-gradient(circle_at_center,#ececea_0,#fafaf7_70%)] p-2 [touch-action:none]"
@@ -390,37 +490,74 @@ export default function Editor({ spec, initialDesignId }: Props) {
         </div>
 
         {/* Desktop sidebar */}
-        <aside className="hidden border-l border-ink/10 bg-white p-4 lg:block">
-          <Controls
-            textValue={textValue}
-            setTextValue={setTextValue}
-            fontFamily={fontFamily}
-            setFontFamily={applyFontToSelection}
-            fillColor={fillColor}
-            setFillColor={applyFillToSelection}
-            onAddText={addText}
-            onAddRect={addRect}
-            onAddCircle={addCircle}
-            onUpload={uploadImage}
-            onDelete={deleteSelected}
-            hasSelection={hasSelection}
-          />
-          <Legend className="mt-4" />
-          {designId && (
-            <Link
-              href={{ pathname: "/cart", query: { add: designId, product: spec.key } }}
-              className="btn-primary mt-4 w-full"
-            >
-              Add to cart →
-            </Link>
-          )}
+        <aside className="hidden border-l border-ink/10 bg-white lg:flex lg:flex-col">
+          <div className="flex border-b border-ink/10 text-xs">
+            {(["templates", "elements", "tools"] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setSidebarTab(t)}
+                className={`flex-1 px-3 py-2 capitalize ${sidebarTab === t ? "border-b-2 border-ink font-medium" : "text-ink/60"}`}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+          <div className="flex-1 overflow-y-auto p-4">
+            {sidebarTab === "templates" && (
+              <TemplateGrid templates={templates} onPick={applyTemplate} />
+            )}
+            {sidebarTab === "elements" && (
+              <ElementsPanel onPick={(svg) => void addElement(svg)} />
+            )}
+            {sidebarTab === "tools" && (
+              <Controls
+                textValue={textValue}
+                setTextValue={setTextValue}
+                fontFamily={fontFamily}
+                setFontFamily={applyFontToSelection}
+                fillColor={fillColor}
+                setFillColor={applyFillToSelection}
+                onAddText={addText}
+                onAddRect={addRect}
+                onAddCircle={addCircle}
+                onUpload={uploadImage}
+                onDelete={deleteSelected}
+                hasSelection={hasSelection}
+              />
+            )}
+          </div>
+          <div className="border-t border-ink/10 p-4">
+            <Legend />
+            {designId && (
+              <Link
+                href={{ pathname: "/cart", query: { add: designId, product: spec.key } }}
+                className="btn-primary mt-3 w-full"
+              >
+                Add to cart →
+              </Link>
+            )}
+          </div>
         </aside>
       </div>
 
       {/* Mobile bottom dock */}
       <div className="border-t border-ink/10 bg-white pb-[env(safe-area-inset-bottom)] lg:hidden">
-        {openTool === "text" && (
-          <Sheet onClose={() => setOpenTool(null)} title="Add text">
+        {openSheet === "templates" && (
+          <Sheet onClose={() => setOpenSheet(null)} title="Pick a template">
+            <TemplateGrid templates={templates} onPick={applyTemplate} compact />
+            <button type="button" onClick={() => setOpenSheet(null)} className="btn mt-3 w-full">
+              Start from blank
+            </button>
+          </Sheet>
+        )}
+        {openSheet === "elements" && (
+          <Sheet onClose={() => setOpenSheet(null)} title="Elements">
+            <ElementsPanel onPick={(svg) => { void addElement(svg); setOpenSheet(null); }} />
+          </Sheet>
+        )}
+        {openSheet === "text" && (
+          <Sheet onClose={() => setOpenSheet(null)} title="Add text">
             <input
               value={textValue}
               onChange={(e) => setTextValue(e.target.value)}
@@ -428,17 +565,13 @@ export default function Editor({ spec, initialDesignId }: Props) {
               className="w-full rounded border border-ink/20 px-3 py-2 text-base"
             />
             <div className="mt-3 flex gap-2">
-              <button type="button" className="btn flex-1" onClick={() => setOpenTool(null)}>
-                Cancel
-              </button>
-              <button type="button" className="btn-primary flex-1" onClick={addText}>
-                Add
-              </button>
+              <button type="button" className="btn flex-1" onClick={() => setOpenSheet(null)}>Cancel</button>
+              <button type="button" className="btn-primary flex-1" onClick={addText}>Add</button>
             </div>
           </Sheet>
         )}
-        {openTool === "fonts" && (
-          <Sheet onClose={() => setOpenTool(null)} title="Font">
+        {openSheet === "fonts" && (
+          <Sheet onClose={() => setOpenSheet(null)} title="Font">
             <div className="grid grid-cols-2 gap-2">
               {PRINT_FONTS.map((f) => (
                 <button
@@ -446,10 +579,7 @@ export default function Editor({ spec, initialDesignId }: Props) {
                   type="button"
                   className={`rounded border px-3 py-3 text-left text-base ${fontFamily === f.family ? "border-ink bg-ink text-white" : "border-ink/20"}`}
                   style={{ fontFamily: f.cssStack }}
-                  onClick={() => {
-                    applyFontToSelection(f.family);
-                    setOpenTool(null);
-                  }}
+                  onClick={() => { applyFontToSelection(f.family); setOpenSheet(null); }}
                 >
                   {f.family}
                 </button>
@@ -457,41 +587,26 @@ export default function Editor({ spec, initialDesignId }: Props) {
             </div>
           </Sheet>
         )}
-        {openTool === "style" && (
-          <Sheet onClose={() => setOpenTool(null)} title="Color">
+        {openSheet === "color" && (
+          <Sheet onClose={() => setOpenSheet(null)} title="Color">
             <div className="flex items-center gap-3">
-              <input
-                type="color"
-                value={fillColor}
-                onChange={(e) => applyFillToSelection(e.target.value)}
-                className="h-12 w-16 cursor-pointer rounded border border-ink/20"
-              />
-              <input
-                type="text"
-                value={fillColor}
-                onChange={(e) => applyFillToSelection(e.target.value)}
-                className="flex-1 rounded border border-ink/20 px-3 py-3 text-base font-mono"
-              />
+              <input type="color" value={fillColor} onChange={(e) => applyFillToSelection(e.target.value)} className="h-12 w-16 cursor-pointer rounded border border-ink/20" />
+              <input type="text" value={fillColor} onChange={(e) => applyFillToSelection(e.target.value)} className="flex-1 rounded border border-ink/20 px-3 py-3 text-base font-mono" />
             </div>
             <div className="mt-3 flex flex-wrap gap-2">
-              {["#111111", "#ffffff", "#dc2626", "#ea580c", "#facc15", "#16a34a", "#2563eb", "#7c3aed"].map((c) => (
-                <button
-                  key={c}
-                  type="button"
-                  onClick={() => applyFillToSelection(c)}
-                  className="h-9 w-9 rounded-full border border-ink/20"
-                  style={{ background: c }}
-                  aria-label={`Color ${c}`}
-                />
+              {["#0f172a", "#ffffff", "#ec4899", "#facc15", "#14b8a6", "#dc2626", "#2563eb", "#7c3aed"].map((c) => (
+                <button key={c} type="button" onClick={() => applyFillToSelection(c)} className="h-9 w-9 rounded-full border border-ink/20" style={{ background: c }} aria-label={`Color ${c}`} />
               ))}
             </div>
           </Sheet>
         )}
 
         <div className="flex items-stretch gap-1 overflow-x-auto px-2 py-2">
-          <DockBtn label="Text" onClick={() => setOpenTool("text")} icon="T" />
-          <DockBtn label="Rect" onClick={addRect} icon="▭" />
-          <DockBtn label="Circle" onClick={addCircle} icon="◯" />
+          <DockBtn label="Templates" icon="✦" onClick={() => setOpenSheet("templates")} />
+          <DockBtn label="Elements" icon="❖" onClick={() => setOpenSheet("elements")} />
+          <DockBtn label="Text" icon="T" onClick={() => setOpenSheet("text")} />
+          <DockBtn label="Rect" icon="▭" onClick={addRect} />
+          <DockBtn label="Circle" icon="◯" onClick={addCircle} />
           <DockBtn
             label="Image"
             icon="🖼"
@@ -510,9 +625,9 @@ export default function Editor({ spec, initialDesignId }: Props) {
               />
             }
           />
-          <DockBtn label="Font" onClick={() => setOpenTool("fonts")} icon="Aa" disabled={!hasSelection} />
-          <DockBtn label="Color" onClick={() => setOpenTool("style")} icon="●" />
-          <DockBtn label="Delete" onClick={deleteSelected} icon="✕" disabled={!hasSelection} />
+          <DockBtn label="Font" icon="Aa" onClick={() => setOpenSheet("fonts")} disabled={!hasSelection} />
+          <DockBtn label="Color" icon="●" onClick={() => setOpenSheet("color")} />
+          <DockBtn label="Delete" icon="✕" onClick={deleteSelected} disabled={!hasSelection} />
         </div>
         <div className="flex items-center justify-between border-t border-ink/10 px-3 py-2 text-xs text-ink/60">
           <span>
@@ -521,14 +636,77 @@ export default function Editor({ spec, initialDesignId }: Props) {
             {saveState === "error" && <span className="text-red-600">Save failed</span>}
           </span>
           {designId && (
-            <Link
-              href={{ pathname: "/cart", query: { add: designId, product: spec.key } }}
-              className="btn-primary px-3 py-1 text-xs"
-            >
+            <Link href={{ pathname: "/cart", query: { add: designId, product: spec.key } }} className="btn-primary px-3 py-1 text-xs">
               Add to cart →
             </Link>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ----------------------------- subcomponents ------------------------------ */
+
+function TemplateGrid({
+  templates,
+  onPick,
+  compact,
+}: {
+  templates: TemplateDef[];
+  onPick: (t: TemplateDef) => void;
+  compact?: boolean;
+}) {
+  return (
+    <div className={`grid gap-2 ${compact ? "grid-cols-2" : "grid-cols-2"}`}>
+      {templates.map((t) => (
+        <button
+          key={t.id}
+          type="button"
+          onClick={() => onPick(t)}
+          className="group flex flex-col gap-1 rounded border border-ink/15 p-2 text-left transition hover:border-ink"
+        >
+          <div className="flex h-16 overflow-hidden rounded">
+            {t.swatch.map((c, i) => (
+              <div key={i} className="flex-1" style={{ background: c }} />
+            ))}
+          </div>
+          <div className="text-xs font-medium">{t.name}</div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ElementsPanel({ onPick }: { onPick: (svg: string) => void }) {
+  const [activeCat, setActiveCat] = useState<ElementCategory>("shapes");
+  const items = elementsByCategory(activeCat);
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap gap-1 text-xs">
+        {ELEMENT_CATEGORIES.map((c) => (
+          <button
+            key={c.id}
+            type="button"
+            onClick={() => setActiveCat(c.id)}
+            className={`rounded px-2 py-1 ${activeCat === c.id ? "bg-ink text-white" : "bg-ink/5 text-ink/70"}`}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+      <div className="grid grid-cols-4 gap-2">
+        {items.map((el) => (
+          <button
+            key={el.id}
+            type="button"
+            onClick={() => onPick(el.svg)}
+            className="flex aspect-square items-center justify-center rounded border border-ink/15 bg-white p-2 text-ink hover:border-ink"
+            title={el.name}
+            // eslint-disable-next-line react/no-danger
+            dangerouslySetInnerHTML={{ __html: el.svg }}
+          />
+        ))}
       </div>
     </div>
   );
@@ -585,24 +763,12 @@ function Controls(props: {
           className="w-full rounded border border-ink/20 px-2 py-1 text-sm"
         >
           {PRINT_FONTS.map((f) => (
-            <option key={f.family} value={f.family}>
-              {f.family}
-            </option>
+            <option key={f.family} value={f.family}>{f.family}</option>
           ))}
         </select>
         <div className="flex items-center gap-2">
-          <input
-            type="color"
-            value={props.fillColor}
-            onChange={(e) => props.setFillColor(e.target.value)}
-            className="h-8 w-8 cursor-pointer rounded border border-ink/20"
-          />
-          <input
-            type="text"
-            value={props.fillColor}
-            onChange={(e) => props.setFillColor(e.target.value)}
-            className="flex-1 rounded border border-ink/20 px-2 py-1 text-sm font-mono"
-          />
+          <input type="color" value={props.fillColor} onChange={(e) => props.setFillColor(e.target.value)} className="h-8 w-8 cursor-pointer rounded border border-ink/20" />
+          <input type="text" value={props.fillColor} onChange={(e) => props.setFillColor(e.target.value)} className="flex-1 rounded border border-ink/20 px-2 py-1 text-sm font-mono" />
         </div>
         <button type="button" className="btn w-full" onClick={props.onDelete} disabled={!props.hasSelection}>
           Delete selected
@@ -612,33 +778,22 @@ function Controls(props: {
   );
 }
 
-function Legend({ className = "" }: { className?: string }) {
+function Legend() {
   return (
-    <div className={`text-xs text-ink/60 space-y-1 ${className}`}>
-      <div>
-        <span className="inline-block h-2 w-3 align-middle border border-red-500 mr-1" />
-        Bleed (extend artwork to here)
-      </div>
-      <div>
-        <span className="inline-block h-2 w-3 align-middle border border-ink mr-1" />
-        Trim (final cut)
-      </div>
-      <div>
-        <span className="inline-block h-2 w-3 align-middle border border-blue-500 mr-1" />
-        Safe (keep text inside)
-      </div>
+    <div className="text-xs text-ink/60 space-y-1">
+      <div><span className="inline-block h-2 w-3 align-middle border border-red-500 mr-1" />Bleed</div>
+      <div><span className="inline-block h-2 w-3 align-middle border border-ink mr-1" />Trim</div>
+      <div><span className="inline-block h-2 w-3 align-middle border border-blue-500 mr-1" />Safe</div>
     </div>
   );
 }
 
 function Sheet({ title, children, onClose }: { title: string; children: React.ReactNode; onClose: () => void }) {
   return (
-    <div className="border-b border-ink/10 bg-white p-3">
+    <div className="max-h-[60vh] overflow-y-auto border-b border-ink/10 bg-white p-3">
       <div className="mb-2 flex items-center justify-between">
         <div className="text-sm font-medium">{title}</div>
-        <button type="button" onClick={onClose} className="text-sm text-ink/60">
-          Close
-        </button>
+        <button type="button" onClick={onClose} className="text-sm text-ink/60">Close</button>
       </div>
       {children}
     </div>
