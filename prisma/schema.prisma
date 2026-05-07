@@ -1,0 +1,73 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  createdAt DateTime @default(now())
+  designs   Design[]
+}
+
+model Design {
+  id           String   @id @default(cuid())
+  userId       String?
+  user         User?    @relation(fields: [userId], references: [id])
+  productKey   String
+  name         String   @default("Untitled design")
+  /// Versioned JSON: { version, productKey, sides: [fabricJSON, ...] }
+  data         Json
+  thumbnailUrl String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  orderItems   OrderItem[]
+
+  @@index([userId])
+  @@index([productKey])
+}
+
+model Order {
+  id              String   @id @default(cuid())
+  shopifyOrderId  String   @unique
+  shopifyOrderNo  String
+  email           String?
+  totalUsd        Decimal? @db.Decimal(10, 2)
+  status          String   @default("received")
+  rawPayload      Json
+  createdAt       DateTime @default(now())
+  items           OrderItem[]
+  attempts        FulfillmentAttempt[]
+}
+
+model OrderItem {
+  id              String  @id @default(cuid())
+  orderId         String
+  order           Order   @relation(fields: [orderId], references: [id])
+  shopifyLineId   String
+  designId        String?
+  design          Design? @relation(fields: [designId], references: [id])
+  productKey      String
+  paper           String?
+  quantity        Int
+  pdfPaths        String[] @default([])
+
+  @@index([orderId])
+  @@index([designId])
+}
+
+model FulfillmentAttempt {
+  id        String   @id @default(cuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id])
+  fulfiller String
+  status    String
+  detail    String?
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+}
