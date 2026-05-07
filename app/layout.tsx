@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import Link from "next/link";
 import "./globals.css";
 
@@ -6,6 +6,16 @@ export const metadata: Metadata = {
   title: "Printshop Designer",
   description:
     "Design business cards, postcards, envelopes and flyers, then order through our shop.",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  // Allow user pinch-zoom on browse pages; the editor manages its own
+  // canvas-level pinch and prevents page-level pinch over the artwork.
+  maximumScale: 5,
+  themeColor: "#fafaf7",
+  viewportFit: "cover",
 };
 
 export default function RootLayout({

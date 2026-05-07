@@ -14,19 +14,47 @@ export interface EditorChrome {
 export interface InitOptions {
   /** Width of the editor viewport in px; we scale the print size to fit. */
   viewportWidthPx: number;
+  /** Optional viewport height; used to also fit tall products (flyer) on phones. */
+  viewportHeightPx?: number;
   /** Initial side index (0 = front). */
   side: number;
   spec: ProductSpec;
 }
 
-export function computeDisplayPpi(spec: ProductSpec, viewportWidthPx: number): number {
-  const totalIn = spec.widthIn + 2 * spec.bleedIn;
-  return Math.max(48, Math.min(spec.dpi, Math.floor(viewportWidthPx / totalIn)));
+export function computeDisplayPpi(
+  spec: ProductSpec,
+  viewportWidthPx: number,
+  viewportHeightPx?: number,
+): number {
+  const totalWIn = spec.widthIn + 2 * spec.bleedIn;
+  const totalHIn = spec.heightIn + 2 * spec.bleedIn;
+  const fromW = Math.floor(viewportWidthPx / totalWIn);
+  const fromH = viewportHeightPx ? Math.floor(viewportHeightPx / totalHIn) : Infinity;
+  return Math.max(48, Math.min(spec.dpi, Math.min(fromW, fromH)));
+}
+
+/** Touch-friendly defaults applied to every selectable Fabric object. */
+export function applyTouchDefaults(): void {
+  fabric.FabricObject.ownDefaults = {
+    ...fabric.FabricObject.ownDefaults,
+    cornerSize: 18,
+    touchCornerSize: 36,
+    cornerStyle: "circle",
+    cornerColor: "#111111",
+    cornerStrokeColor: "#ffffff",
+    transparentCorners: false,
+    borderColor: "#111111",
+    padding: 6,
+    // Rotation is awkward on touch and we don't honor it in the PDF
+    // renderer yet — hide the rotate handle.
+    hasRotatingPoint: false,
+  } as typeof fabric.FabricObject.ownDefaults;
 }
 
 export function initCanvas(el: HTMLCanvasElement, opts: InitOptions): EditorChrome {
   const { spec } = opts;
-  const ppi = computeDisplayPpi(spec, opts.viewportWidthPx);
+  applyTouchDefaults();
+  const ppi = computeDisplayPpi(spec, opts.viewportWidthPx, opts.viewportHeightPx);
   const totalW = (spec.widthIn + 2 * spec.bleedIn) * ppi;
   const totalH = (spec.heightIn + 2 * spec.bleedIn) * ppi;
 
@@ -36,6 +64,10 @@ export function initCanvas(el: HTMLCanvasElement, opts: InitOptions): EditorChro
     backgroundColor: "#ffffff",
     preserveObjectStacking: true,
     selection: true,
+    // Better touch experience: stop iOS Safari from selecting page text on
+    // long-press, and disable browser pinch over the canvas.
+    allowTouchScrolling: false,
+    enableRetinaScaling: true,
   });
 
   const guides = drawGuides(canvas, spec, ppi);
