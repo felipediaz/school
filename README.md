@@ -74,12 +74,64 @@ and watch autosave hit `/api/designs`.
 
 ## Deploying to Opalstack
 
-- Create a Node 22 app via Opalstack control panel.
-- Set `DATABASE_URL` to the Opalstack-managed Postgres connection string.
-- Set `STORAGE_ROOT` to a writable directory in the app's home dir.
-- Set Shopify env vars (Admin + Storefront token + webhook secret).
-- Build: `npm install --omit=dev` then `npm run build`.
-- Start: `npm run start` (port supplied by Opalstack via `$PORT`).
+One-time setup, then `./bin/deploy.sh` for every release.
+
+### One-time
+
+1. **Create a Node app** in the Opalstack control panel (Node.js 22). Note the
+   port Opalstack assigns — it's exposed to your `start` script as `$PORT`.
+2. **Create a Postgres database** in the same control panel and grab the
+   connection string.
+3. **Create a site** that proxies to the Node app and attach a domain (with
+   the included Let's Encrypt cert).
+4. SSH in and clone the repo into the app directory:
+   ```bash
+   ssh <user>@<host>.opalstack.com
+   cd ~/apps/printshop
+   git clone <repo> .
+   git checkout claude/printshop-design-app-SUDpz
+   ```
+5. Create the env file Opalstack sources before `start`:
+   ```bash
+   cp .env.example .env
+   # edit .env and set:
+   #   DATABASE_URL=<the postgres URL from step 2>
+   #   STORAGE_ROOT=/home/<user>/apps/printshop/storage
+   #   APP_ORIGIN=https://yourdomain.com
+   #   SHOPIFY_SHOP / SHOPIFY_ADMIN_TOKEN / SHOPIFY_STOREFRONT_TOKEN /
+   #   SHOPIFY_WEBHOOK_SECRET (when ready)
+   #   FULFILLER=stub          # flip to "zoo" + fill ZOO_SFTP_* when live
+   mkdir -p storage/uploads storage/orders storage/outbox
+   ```
+6. Make sure Opalstack's generated `start` script loads `.env` and runs
+   `npm start` — the script is in `~/apps/printshop/start`. Add at the top:
+   ```bash
+   set -a; [ -f .env ] && . ./.env; set +a
+   ```
+7. First-time deploy:
+   ```bash
+   ./bin/deploy.sh
+   ```
+
+### Subsequent deploys
+
+```bash
+ssh <user>@<host>.opalstack.com
+cd ~/apps/printshop
+./bin/deploy.sh                 # uses current branch
+./bin/deploy.sh some-branch     # deploys a different branch
+```
+
+The script pulls, runs `npm install` (postinstall regenerates Prisma),
+applies migrations with `prisma migrate deploy`, rebuilds Next, then calls
+Opalstack's generated `restart` script.
+
+### Previewing on mobile
+
+Open `https://yourdomain.com/design/business-card` on your phone — the
+editor is touch-tuned (pinch-zoom, 36px handles, bottom dock with slide-up
+sheets). For pre-DNS testing, use the temporary
+`apps.<user>.opalstack.com` URL from the control panel.
 
 ## v1 scope notes
 

@@ -3,13 +3,12 @@ import path from "node:path";
 import crypto from "node:crypto";
 
 /**
- * Storage root. On long-lived hosts (Opalstack, a VPS) this is a writable
- * directory under the project. On Vercel/serverless, the function filesystem
- * is read-only except for `/tmp`; we fall back there so previews work, with
- * the caveat that uploads & rendered PDFs don't survive across invocations.
+ * Storage root for uploads, rendered PDFs, and the local outbox. Resolves to
+ * a persistent directory under the Node app's home on Opalstack — point
+ * STORAGE_ROOT at e.g. `/home/<user>/apps/printshop/storage` in the systemd
+ * env file.
  */
-const DEFAULT_ROOT = process.env.VERCEL ? "/tmp/printshop" : "./storage";
-const STORAGE_ROOT = path.resolve(process.env.STORAGE_ROOT ?? DEFAULT_ROOT);
+const STORAGE_ROOT = path.resolve(process.env.STORAGE_ROOT ?? "./storage");
 
 async function ensureDir(dir: string) {
   await fs.mkdir(dir, { recursive: true });
