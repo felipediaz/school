@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "prisma generate && next build",
+    "postinstall": "prisma generate",
     "start": "next start -p ${PORT:-3000}",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
@@ -13,6 +14,7 @@
     "render-test": "tsx scripts/render-test.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.69.0",
     "@prisma/client": "^5.22.0",
     "fabric": "^6.4.3",
     "next": "15.0.3",

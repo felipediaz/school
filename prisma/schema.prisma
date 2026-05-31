@@ -1,5 +1,8 @@
 generator client {
   provider = "prisma-client-js"
+  // Prisma compiles the engine for the host where `prisma generate` runs.
+  // Opalstack builds on the same host that serves traffic, so `native` is
+  // sufficient. Add another `binaryTargets` entry if you ever build elsewhere.
 }
 
 datasource db {

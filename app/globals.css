@@ -10,6 +10,14 @@ html,
 body {
   background: #fafaf7;
   color: #111;
+  /* Avoid iOS double-tap zoom inside the editor; pages scroll normally. */
+  -webkit-text-size-adjust: 100%;
+}
+
+/* Inside the editor stage, prevent the browser from interpreting touches as
+   page-level pan/zoom — Fabric (and our pinch handler) own them. */
+.editor-shell canvas {
+  touch-action: none;
 }
 
 .btn {

@@ -2,6 +2,12 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 
+/**
+ * Storage root for uploads, rendered PDFs, and the local outbox. Resolves to
+ * a persistent directory under the Node app's home on Opalstack — point
+ * STORAGE_ROOT at e.g. `/home/<user>/apps/printshop/storage` in the systemd
+ * env file.
+ */
 const STORAGE_ROOT = path.resolve(process.env.STORAGE_ROOT ?? "./storage");
 
 async function ensureDir(dir: string) {
